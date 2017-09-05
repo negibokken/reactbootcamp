@@ -1,0 +1,235 @@
+#!/usr/bin/env ruby
+
+https = (File.basename(__FILE__) == 'https')
+
+
+HTTP_HELP=<<EOS
+simplest http server shows current directory
+- default port: 3000
+- export text formats as text/plain (md, log, json etc)
+- returns default favicon: $DOTFILES/misc/favicon.ico
+
+$ http
+$ http 4000
+EOS
+
+HTTPS_HELP=<<EOS
+simplest http server shows current directory
+- default port: 3000
+- default key : /keys/key.pem
+- default crt : /keys/cert.pem
+- export text formats as text/plain (md, log, json etc)
+- returns default favicon: $DOTFILES/misc/favicon.ico
+
+$ https
+$ https 4000 ./key.pem ./cert.pem
+EOS
+
+if ARGV.include?('-h')
+  puts https ? HTTPS_HELP : HTTP_HELP
+  exit(0)
+end
+
+require "webrick"
+require "webrick/https"
+require "json"
+
+# common
+port = ARGV.shift || 3000
+
+# https
+key  = ARGV.shift || "/keys/key.pem"
+cert = ARGV.shift || "/keys/cert.pem"
+
+# http://svn.ruby-lang.org/cgi-bin/viewvc.cgi/trunk/lib/webrick/httputils.rb?view=markup
+mime = WEBrick::HTTPUtils::DefaultMimeTypes.merge({
+  "js"       => "text/javascript",
+  "json"     => "text/json",
+  "log"      => "text/plain",
+  "md"       => "text/plain",
+  "markdown" => "text/plain",
+  "webp"     => "image/webp",
+})
+
+http_config = {
+  :Port            => port,
+  :DocumentRoot    => ".",
+  :MimeTypes       => mime,
+  :StartCallback   => lambda {
+    puts `ip`
+  },
+  :RequestCallback => lambda {|req, res|
+    res.header.merge!({
+      "X-Protocol" => https ? "https" : "http",
+
+      #"Access-Control-Allow-Methods" => "GET, PUT, POST, DELETE, HEAD, OPTIONS",
+      #"Access-Control-Allow-Origin" => "*",
+      #"Access-Control-Allow-Credentials" => "true",
+      #"Access-Control-Allow-Headres" => "Accept, Accept-Encoding, Accept-Language, Cookie, Referer, User-Agent",
+      #"Service-Worker-Allowed" => "/",
+
+      #"Cache-Control" => "max-age=10, stale-if-error=30"
+      "Cache-Control" => "max-age=1, stale-while-revalidate=100, stale-if-error=100"
+    })
+  }
+}
+
+#https_config = http_config.merge({
+#  :SSLEnable       => true,
+#  :SSLCertificate  => OpenSSL::X509::Certificate.new(File.open(cert).read),
+#  :SSLPrivateKey   => OpenSSL::PKey::RSA.new(File.open(key).read),
+#  # auto generate self signed cert file
+#  # :SSLCertName => [["CN", "devserver"]],
+#})
+
+server = WEBrick::HTTPServer.new(https ? https_config : http_config)
+
+# /favicon.ico
+server.mount("/favicon.ico", WEBrick::HTTPServlet::FileHandler, "#{__dir__}/../misc/favicon.ico")
+
+
+# random handler
+random = Proc.new do |req, res|
+  sleep(2)
+  @i ||= 0
+  seq = (@i+=1).to_s
+  now = Time.now.to_s
+  random = (0...8).map{ ('A'..'Z').to_a[rand(26)] }.join
+
+  ext = File.extname(req.path)
+  ext = ".html" if ext == ""
+  res.header.merge!({
+    "Content-Type" => "text/#{ext.sub("\.", "")}",
+    "X-Seq" => seq
+  })
+
+  body = ""
+  case ext
+  when ".json"
+    body = JSON.pretty_generate({
+      seq: seq,
+      now: now,
+      random: random
+    })
+  when ".html"
+    body =<<-EOS
+<!DOCTYPE html>
+<meta charset=utf-8>
+<title>random</title>
+<h1>Test</h1>
+<a href=/random>/random</a>
+<dl>
+  <dt>seq</dt><dd>#{seq}</dd>
+  <dt>now</dt><dd>#{now}</dd>
+  <dt>random</dt><dd>#{random}</dd>
+</dl>
+    EOS
+  end
+  res.body = body
+end
+
+# /random.(html|json)
+server.mount_proc('/random', random)
+server.mount_proc('/random.html', random)
+server.mount_proc('/random.json', random)
+
+# /upload
+class Uploader < WEBrick::HTTPServlet::AbstractServlet
+  def do_POST(req, res)
+    filename = req.query['upload'].filename
+    uploadedFile = File.open(filename, "wb")
+    uploadedFile.write req.query['upload'].to_s
+    uploadedFile.close
+    res.set_redirect(WEBrick::HTTPStatus::SeeOther, '/')
+  end
+
+  def do_GET(req, res)
+    res.content_type = "text/html"
+    res.body = <<-EOS
+      <form method=POST action=/upload enctype=multipart/form-data>
+        <input type=file name=upload />
+        <input type=submit value=upload />
+      </form>
+
+      <!--
+      var form = new FormData();
+      var blob = new Blob(['aaaaa'], { type: 'text/plain' });
+      form.append('file', blob);
+      var xhr = new XMLHttpRequest();
+
+      xhr.open('POST', 'https://udc.beta2.jp01.ucs.ricoh.com/logupload/browser');
+      xhr.send(form);
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', 'http://localhost:8080/receive');
+      xhr.setRequestHeader('Content-Type', 'multipart/form-data; boundary=----WebKitFormBoundaryQgCIV7W1WxKLHtbA');
+      xhr.send(''
+      + '------WebKitFormBoundaryQgCIV7W1WxKLHtbA\n'
+      + 'Content-Disposition: form-data; name="file"; filename="blob"\n'
+      + 'Content-Type: text/plain\n'
+      + '\n'
+      + logfile
+      + '\n'
+      + '------WebKitFormBoundaryQgCIV7W1WxKLHtbA--\n'
+      );
+      -->
+    EOS
+  end
+end
+server.mount('/upload', Uploader)
+
+# /login
+class Login < WEBrick::HTTPServlet::AbstractServlet
+  def do_POST(req, res)
+    username = req.query['username']
+    password = req.query['password']
+    cookie = WEBrick::Cookie.new("session_id", "1q2w3e4r5t6y7u8i9o0p")
+    res["Set-Cookie"] = cookie.to_s
+    res.content_type = "text/html"
+    res.body = <<-EOS
+      <h1>Login Success</h1>
+      <p>hello #{username} !</p>
+    EOS
+  end
+
+  def do_GET(req, res)
+    res.content_type = "text/html"
+    res.body = <<-EOS
+      <style>
+        form {
+          width: 15em;
+          padding: 1em;
+        }
+        label {
+        }
+        div {
+          margin: 1em 0 0 0;
+        }
+        button {
+          width: 4em;
+          float: right;
+          margin-right: 0;
+        }
+      </style>
+      <form method=POST action=/login>
+        <fieldset>
+          <legend>login</legend>
+          <div>
+            <label for=username>username:</label>
+            <input id=username type=text name=username placeholder=username />
+          </div>
+          <div>
+            <label for=password>password:</label>
+            <input id=password type=password name=password placeholder=password />
+          </div>
+          <div>
+            <button type=submit>ok</button>
+          </div>
+        </fieldset>
+      </form>
+    EOS
+  end
+end
+server.mount('/login', Login)
+
+Signal.trap("INT") { server.shutdown }
+server.start
